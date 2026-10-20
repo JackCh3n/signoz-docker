@@ -54,6 +54,8 @@ signoz-docker/
 │   ├── histogram-quantile-linux-amd64
 │   └── histogram-quantile-linux-arm64
 ├── .github/workflows/ci.yml             # push / PR 轻量校验（不拉镜像）
+├── .github/workflows/release.yml        # main / tag 构建双架构离线包并发布 Release
+├── .cnb.yml                             # CNB 构建与发布流水线（与 GitHub 对齐）
 └── dist/                                # 打包产物（不入库）
 ```
 
@@ -82,6 +84,11 @@ cd signoz-docker
 dist/signoz-offline-v0.146.0-amd64.tar.gz
 dist/signoz-offline-v0.146.0-amd64.tar.gz.sha256
 ```
+
+也可以跳过本地打包，直接下载 CI 已构建好的离线包：
+
+- GitHub：[Releases](https://github.com/JackCh3n/signoz-docker/releases)（`latest` 滚动更新，或 `v*` 版本 tag）
+- CNB：[Releases](https://cnb.cool/jackch3n/signoz-docker/-/releases)
 
 离线包内含：5 个镜像的 `docker save` 包、Compose 文件、全部配置、两个架构的 histogram-quantile 二进制、安装脚本和 Java Agent（如果指定了 `--with-java-agent`）。
 
@@ -305,13 +312,29 @@ docker compose up -d --force-recreate
 - `histogram-quantile` 二进制来自 SigNoz 官方 Release，许可证见 [assets/histogram-quantile/LICENSE](assets/histogram-quantile/LICENSE)；
 - SigNoz、ClickHouse、PostgreSQL 等组件遵循各自上游许可协议，本项目仅提供部署编排与离线打包脚本。
 
-## 10. CI 校验
+## 10. CI 与发布
 
-`.github/workflows/ci.yml` 在 push、PR 和手动触发时执行以下轻量检查，不拉取镜像、不构建离线包：
+GitHub Actions：
 
-- `bash -n`：脚本语法
-- `shellcheck`：Shell 静态检查
-- `docker compose config`：Compose 文件与变量展开校验
-- 双架构 `histogram-quantile` 二进制存在性与架构校验
+- `.github/workflows/ci.yml`：push、PR 和手动触发时做轻量校验，不拉镜像——
+  `bash -n`、ShellCheck、`docker compose config`、双架构 `histogram-quantile`
+  二进制存在性与架构校验。
+- `.github/workflows/release.yml`：真正构建并发布离线包。
+  - push 到 `main` / `master`：构建 `amd64` + `arm64`，滚动更新 Release `latest`；
+  - push tag `v*`：发布到同名 Release（例如 `v0.146.0`）；
+  - 手动触发：可指定 Release 标签与架构（`all` / `amd64` / `arm64`）。
 
-真正的离线包构建在联网打包机上由 `bundle.sh` 完成，避免 CI 反复下载数 GB 镜像。
+CNB（[cnb.cool](https://cnb.cool/jackch3n/signoz-docker)）的 `.cnb.yml` 与上述行为对齐：
+main / master push 发布 `latest`，`v*` tag 发布同名 Release，页面手动触发发布 `latest`，
+PR 只做轻量校验。CNB 流水线在同一条流水线里串行构建两个架构，最后统一上传附件。
+
+发版示例：
+
+```bash
+git tag v0.146.0
+git push origin v0.146.0
+```
+
+发布附件命名固定为 `signoz-offline-<SigNoz版本>-<架构>.tar.gz` 与对应 `.sha256`，
+下载后先 `sha256sum -c` 校验，再按第 4.2 节安装。CI 构建使用与本地 `bundle.sh`
+相同的脚本，因此产物内容一致。

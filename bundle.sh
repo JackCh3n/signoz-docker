@@ -157,6 +157,8 @@ done
 
 for img in "${IMAGES[@]}"; do
   docker image inspect "$img" >/dev/null 2>&1 || die "镜像拉取后仍不存在: $img"
+  _img_arch="$(docker image inspect -f '{{.Architecture}}' "$img")"
+  [ "$_img_arch" = "$ARCH" ] || die "镜像架构不匹配: ${img} 实际为 ${_img_arch}，期望 ${ARCH}（镜像源可能忽略了 --platform）"
 done
 
 # ---- 导出镜像 ------------------------------------------------------------
@@ -164,7 +166,12 @@ c_step "导出镜像"
 mkdir -p "$OUT_DIR"
 IMG_TAR="${OUT_DIR}/signoz-images-${SIGNOZ_VERSION}-${ARCH}.tar"
 docker save -o "$IMG_TAR" "${IMAGES[@]}"
-gzip -1 -f "$IMG_TAR"
+# pigz 可用时多线程压缩；CI 上 2 GB 级别的 tar 用单线程 gzip 会慢很多
+if command -v pigz >/dev/null 2>&1; then
+  pigz -1 -f "$IMG_TAR"
+else
+  gzip -1 -f "$IMG_TAR"
+fi
 IMG_GZ="${IMG_TAR}.gz"
 c_info "镜像包: ${IMG_GZ}（$(du -h "$IMG_GZ" | cut -f1)）"
 
@@ -201,6 +208,8 @@ cp "$IMG_GZ" "${STAGE}/images/"
 
 tar -C "$OUT_DIR" -czf "${OUT_DIR}/${PKG}.tar.gz" "$PKG"
 rm -rf "$STAGE"
+# 镜像 tar.gz 已装进离线包，删除 dist 根目录下的中间件，否则 CI 会同时留下两份约 1 GB 的文件
+rm -f "$IMG_GZ"
 
 PKG_FILE="${OUT_DIR}/${PKG}.tar.gz"
 

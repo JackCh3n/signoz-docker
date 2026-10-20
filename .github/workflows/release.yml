@@ -1,0 +1,292 @@
+# =============================================================================
+# SigNoz 离线包 · GitHub Actions 发布流水线
+#
+# 场景
+#   - push main/master : 构建 amd64 + arm64 离线包，滚动发布到 Release `latest`
+#   - push tag v*      : 构建后发布到同名 Release（固化）
+#   - workflow_dispatch: 手动指定 Release 标签与架构
+#
+# 为什么能在这里构建
+#   bundle.sh 只依赖 Docker 与网络，GitHub runner 两者都具备。发布的关键是
+#   `contents: write`：缺少它时创建 Release / 上传附件会报
+#   "Resource not accessible by integration"。
+#
+# 体积与磁盘
+#   5 个镜像压缩后约 0.8 GiB，离线包约 1 GiB，低于 GitHub Release 的 2 GiB
+#   单文件上限。docker save 的中间 tar 约 2 GiB，构建前先清理 runner 预装工具
+#   链，避免 14 GB 的默认磁盘被中间产物占满。
+# =============================================================================
+name: release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+    paths:
+      - "bundle.sh"
+      - "install.sh"
+      - "docker-compose.yaml"
+      - ".env.example"
+      - "config/**"
+      - "assets/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release 标签（留空或 latest = 滚动更新 latest）"
+        required: false
+        default: "latest"
+      arch:
+        description: "构建架构"
+        type: choice
+        options:
+          - all
+          - amd64
+          - arm64
+        default: all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  # ── 解析场景 / 标签 / 架构 ────────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      scene: ${{ steps.resolve.outputs.scene }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      title: ${{ steps.resolve.outputs.title }}
+      make_latest: ${{ steps.resolve.outputs.make_latest }}
+      arches: ${{ steps.resolve.outputs.arches }}
+    steps:
+      - id: resolve
+        name: 解析发布场景
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_ARCH: ${{ github.event.inputs.arch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            SCENE="dispatch"
+            TAG="${INPUT_TAG:-latest}"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            SCENE="tag"
+            TAG="$REF_NAME"
+            case "$TAG" in
+              v*) ;;
+              *) echo "::error::Release tag 必须以 v 开头，当前为 ${TAG}"; exit 1 ;;
+            esac
+          else
+            SCENE="mainline"
+            TAG="latest"
+          fi
+
+          case "$SCENE" in
+            mainline)
+              TITLE="SigNoz 离线部署包（latest）"
+              MAKE_LATEST="true"
+              ;;
+            tag)
+              TITLE="SigNoz 离线部署包 ${TAG}"
+              MAKE_LATEST="false"
+              ;;
+            *)
+              TITLE="SigNoz 离线部署包 ${TAG}"
+              if [ "$TAG" = "latest" ]; then MAKE_LATEST="true"; else MAKE_LATEST="false"; fi
+              ;;
+          esac
+
+          case "${INPUT_ARCH:-all}" in
+            amd64)  ARCHES='["amd64"]' ;;
+            arm64)  ARCHES='["arm64"]' ;;
+            all|"") ARCHES='["amd64","arm64"]' ;;
+            *) echo "::error::未知架构: ${INPUT_ARCH}"; exit 1 ;;
+          esac
+
+          echo ">>> 场景=${SCENE} Release=${TAG} 架构=${ARCHES}"
+          {
+            echo "scene=$SCENE"
+            echo "release_tag=$TAG"
+            echo "title=$TITLE"
+            echo "make_latest=$MAKE_LATEST"
+            echo "arches=$ARCHES"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── 构建（每个架构独立 runner，互不争抢磁盘） ─────────────────────────────
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.prepare.outputs.arches) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: 清理 runner 预装工具链
+        run: |
+          set -e
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: 预检
+        run: |
+          set -euo pipefail
+          bash -n bundle.sh install.sh
+          test -x "assets/histogram-quantile/histogram-quantile-linux-${{ matrix.arch }}"
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+
+      - name: 构建 ${{ matrix.arch }} 离线包
+        run: bash ./bundle.sh --arch "${{ matrix.arch }}"
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          cd dist
+          sha256sum -c ./*.sha256
+          for f in ./*.tar.gz; do
+            size="$(stat -c%s "$f")"
+            echo ">>> ${f}: ${size} bytes"
+            if [ "$size" -ge 2147483648 ]; then
+              echo "::error::${f} 超过 GitHub Release 2 GiB 单文件上限"
+              exit 1
+            fi
+          done
+
+      - name: 上传工作流产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: signoz-bundle-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── 汇总发布（单 job 写 Release，避免矩阵并发冲突） ──────────────────────
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCENE: ${{ needs.prepare.outputs.scene }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          TITLE: ${{ needs.prepare.outputs.title }}
+          MAKE_LATEST: ${{ needs.prepare.outputs.make_latest }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mapfile -t ARCHIVES < <(find artifacts -maxdepth 1 -name '*.tar.gz' -print | sort)
+          if [ "${#ARCHIVES[@]}" -eq 0 ]; then
+            echo "::error::没有可发布的离线包"
+            exit 1
+          fi
+          (cd artifacts && sha256sum -c ./*.sha256)
+
+          set -a
+          # shellcheck disable=SC1091
+          . ./.env.example
+          set +a
+
+          {
+            echo "## ${TITLE}"
+            echo
+            echo "SigNoz 单机 Docker Compose **离线部署包**，组件版本已固定，适用于内网 / 离线环境。"
+            echo
+            echo "构建提交：\`${GITHUB_SHA:0:7}\`　构建时间：$(date '+%Y-%m-%d %H:%M %Z')"
+            echo
+            echo "### 组件版本"
+            echo
+            echo "| 组件 | 版本 |"
+            echo "|------|------|"
+            echo "| SigNoz | \`${SIGNOZ_VERSION}\` |"
+            echo "| OTel Collector | \`${COLLECTOR_VERSION}\` |"
+            echo "| ClickHouse Server / Keeper | \`${CLICKHOUSE_VERSION}\` |"
+            echo "| PostgreSQL | \`${POSTGRES_VERSION}\` |"
+            echo
+            echo "### 产物"
+            echo
+            echo "| 架构 | 文件 | 大小 |"
+            echo "|------|------|------|"
+            for f in "${ARCHIVES[@]}"; do
+              name="$(basename "$f")"
+              arch="$(printf '%s' "$name" | sed -nE 's/.*-(amd64|arm64)\.tar\.gz/\1/p')"
+              printf '| %s | %s | %s |\n' "${arch:-unknown}" "\`${name}\`" "$(du -h "$f" | cut -f1)"
+            done
+            echo
+            echo "### 内网安装"
+            echo
+            echo "\`\`\`bash"
+            echo "sha256sum -c signoz-offline-${SIGNOZ_VERSION}-<架构>.tar.gz.sha256"
+            echo "tar xzf signoz-offline-${SIGNOZ_VERSION}-<架构>.tar.gz"
+            echo "cd signoz-offline-${SIGNOZ_VERSION}-<架构>"
+            echo "./install.sh --check   # 预检"
+            echo "./install.sh           # 导入镜像并启动"
+            echo "\`\`\`"
+            echo
+            echo "包内含 5 个镜像的 \`docker save\` 包、Compose 清单、全部配置、双架构 histogram-quantile 与安装脚本；安装过程不访问外网。"
+            echo
+            echo "> 首次启动需初始化 ClickHouse，建议至少 4 GB 内存（推荐 8 GB）与 10 GB 磁盘。"
+          } > notes.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo ">>> Release ${TAG} 已存在，替换离线包附件"
+            gh release view "$TAG" --json assets -q '.assets[].name' | while IFS= read -r name; do
+              case "$name" in
+                signoz-offline-*) gh release delete-asset "$TAG" "$name" --yes >/dev/null || true ;;
+              esac
+            done
+            gh release upload "$TAG" artifacts/*.tar.gz artifacts/*.sha256 --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md
+            if [ "$MAKE_LATEST" = "true" ]; then
+              gh release edit "$TAG" --latest
+            fi
+          else
+            echo ">>> 创建 Release ${TAG}"
+            if [ "$SCENE" = "tag" ]; then
+              gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 \
+                --title "$TITLE" --notes-file notes.md --latest="$MAKE_LATEST"
+            else
+              gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 \
+                --title "$TITLE" --notes-file notes.md \
+                --target "$GITHUB_SHA" --latest="$MAKE_LATEST"
+            fi
+          fi
+
+      - name: 汇总
+        run: |
+          echo "场景    : ${{ needs.prepare.outputs.scene }}"
+          echo "Release : ${{ needs.prepare.outputs.release_tag }}"
+          echo "架构    : ${{ needs.prepare.outputs.arches }}"
+          ls -lh artifacts
