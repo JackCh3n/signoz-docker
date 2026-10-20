@@ -53,6 +53,7 @@ signoz-docker/
 ├── assets/histogram-quantile/           # 离线内置的 ClickHouse 函数二进制
 │   ├── histogram-quantile-linux-amd64
 │   └── histogram-quantile-linux-arm64
+├── .github/workflows/ci.yml             # push / PR 轻量校验（不拉镜像）
 └── dist/                                # 打包产物（不入库）
 ```
 
@@ -303,3 +304,14 @@ docker compose up -d --force-recreate
 - Compose 清单与配置由 [SigNoz Foundry](https://github.com/SigNoz/foundry) 生成；
 - `histogram-quantile` 二进制来自 SigNoz 官方 Release，许可证见 [assets/histogram-quantile/LICENSE](assets/histogram-quantile/LICENSE)；
 - SigNoz、ClickHouse、PostgreSQL 等组件遵循各自上游许可协议，本项目仅提供部署编排与离线打包脚本。
+
+## 10. CI 校验
+
+`.github/workflows/ci.yml` 在 push、PR 和手动触发时执行以下轻量检查，不拉取镜像、不构建离线包：
+
+- `bash -n`：脚本语法
+- `shellcheck`：Shell 静态检查
+- `docker compose config`：Compose 文件与变量展开校验
+- 双架构 `histogram-quantile` 二进制存在性与架构校验
+
+真正的离线包构建在联网打包机上由 `bundle.sh` 完成，避免 CI 反复下载数 GB 镜像。
