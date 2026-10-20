@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          bash -n bundle.sh
+          bash -n install.sh
+
+      - name: ShellCheck
+        run: shellcheck bundle.sh install.sh
+
+      - name: Validate Compose file
+        run: docker compose -f docker-compose.yaml config > /dev/null
+
+      - name: Verify offline assets
+        run: |
+          test -x assets/histogram-quantile/histogram-quantile-linux-amd64
+          test -x assets/histogram-quantile/histogram-quantile-linux-arm64
+          file assets/histogram-quantile/histogram-quantile-linux-amd64 | grep -q 'x86-64'
+          file assets/histogram-quantile/histogram-quantile-linux-arm64 | grep -q 'aarch64'
