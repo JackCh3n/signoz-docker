@@ -112,6 +112,7 @@ else
 fi
 
 set -a
+# shellcheck source=/dev/null
 . "./${ENV_FILE}"
 set +a
 

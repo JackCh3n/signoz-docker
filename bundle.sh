@@ -50,10 +50,16 @@ done
 # ---- 载入版本参数 ----------------------------------------------------------
 if [ -f .env ]; then
   c_info "使用 .env 中的版本参数"
-  set -a; . ./.env; set +a
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
 elif [ -f .env.example ]; then
   c_info "未找到 .env，使用 .env.example 默认值"
-  set -a; . ./.env.example; set +a
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env.example
+  set +a
 else
   die "缺少 .env / .env.example，无法确定镜像版本"
 fi
