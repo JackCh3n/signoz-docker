@@ -1,0 +1,10 @@
+# 本地产物与临时文件
+dist/
+.env
+
+# 打包时下载的 Java Agent（体积较大，不入库）
+assets/otel-javaagent/
+
+# 若手动放置镜像包，避免误提交
+*.tar
+*.tar.gz

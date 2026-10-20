@@ -1,0 +1,236 @@
+# =============================================================================
+# SigNoz 单机 Docker Compose 部署（离线可用）
+#
+# 清单来源：SigNoz Foundry v0.3.0 生成的 Docker Compose（compose flavor）
+# 本项目改动：
+#   1. 所有镜像固定版本（便于离线打包与可复现部署）
+#   2. 端口、版本、数据库口令可通过 .env 覆盖
+#   3. histogram-quantile 改为优先使用离线随包二进制，避免内网启动时访问 GitHub
+#
+# 启动前请确认：docker compose v2 可用、至少 4GB 内存、8080/4317/4318 未被占用
+# =============================================================================
+
+name: signoz
+
+networks:
+  signoz-network:
+    name: signoz-network
+
+services:
+  # ---------------------------------------------------------------------------
+  # OTLP 接收与写入（OpenTelemetry Collector 的 SigNoz 发行版）
+  # Java 应用把 traces / metrics / logs 发到 4317(gRPC) 或 4318(HTTP)
+  # ---------------------------------------------------------------------------
+  ingester:
+    command:
+      - -c
+      - |
+        /signoz-otel-collector migrate sync check &&
+        /signoz-otel-collector --config=/etc/otel-collector-config.yaml --manager-config=/etc/opamp-config.yaml --copy-path=/var/tmp/collector-config.yaml
+    entrypoint:
+      - /bin/sh
+    deploy:
+      replicas: 1
+    environment:
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN: tcp://signoz-telemetrystore-clickhouse-0-0:9000
+      SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
+    image: signoz/signoz-otel-collector:${COLLECTOR_VERSION:-v0.144.14}
+    networks:
+      signoz-network:
+        aliases:
+          - signoz-ingester
+    ports:
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    restart: unless-stopped
+    volumes:
+      - ./config/ingester/ingester.yaml:/etc/otel-collector-config.yaml:ro,z
+      - ./config/ingester/opamp.yaml:/etc/opamp-config.yaml:ro,z
+
+  # ---------------------------------------------------------------------------
+  # 元数据存储（PostgreSQL）
+  # ---------------------------------------------------------------------------
+  signoz-metastore-postgres-0:
+    image: postgres:${POSTGRES_VERSION:-16}
+    container_name: signoz-metastore-postgres-0
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-signoz}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-signoz}
+      POSTGRES_USER: ${POSTGRES_USER:-signoz}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 30s
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-signoz} -d ${POSTGRES_DB:-signoz}
+      timeout: 10s
+    networks:
+      - signoz-network
+    restart: unless-stopped
+    volumes:
+      - signoz-metastore-postgres-0-data:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # SigNoz 后端 + 前端（UI 8080）
+  # ---------------------------------------------------------------------------
+  signoz-signoz-0:
+    image: signoz/signoz:${SIGNOZ_VERSION:-v0.146.0}
+    container_name: signoz-signoz-0
+    depends_on:
+      signoz-metastore-postgres-0:
+        condition: service_healthy
+      signoz-telemetrystore-migrator:
+        condition: service_completed_successfully
+    environment:
+      SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://${POSTGRES_USER:-signoz}:${POSTGRES_PASSWORD:-signoz}@signoz-metastore-postgres-0:5432/${POSTGRES_DB:-signoz}?sslmode=disable
+      SIGNOZ_SQLSTORE_PROVIDER: postgres
+      SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://signoz-telemetrystore-clickhouse-0-0:9000
+      SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      test:
+        - CMD
+        - wget
+        - --spider
+        - -q
+        - http://localhost:8080/api/v1/health
+      timeout: 10s
+    networks:
+      - signoz-network
+    ports:
+      - "${SIGNOZ_HTTP_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse Keeper（协调服务，仅集群内部使用）
+  # ---------------------------------------------------------------------------
+  signoz-telemetrykeeper-clickhousekeeper-0:
+    image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
+    container_name: signoz-telemetrykeeper-clickhousekeeper-0
+    entrypoint:
+      - /usr/bin/clickhouse-keeper
+      - --config-file=/etc/clickhouse-keeper/keeper.yaml
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 40s
+      test:
+        - CMD
+        - clickhouse-keeper-client
+        - -h
+        - localhost
+        - -p
+        - "9181"
+        - -q
+        - ls
+      timeout: 10s
+    networks:
+      - signoz-network
+    restart: unless-stopped
+    volumes:
+      - signoz-telemetrykeeper-0-data:/var/lib/clickhouse-keeper
+      - ./config/telemetrykeeper/clickhousekeeper/keeper-0.yaml:/etc/clickhouse-keeper/keeper.yaml:ro,z
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse（遥测数据存储，仅集群内部使用）
+  # ---------------------------------------------------------------------------
+  signoz-telemetrystore-clickhouse-0-0:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12.5}
+    container_name: signoz-telemetrystore-clickhouse-0-0
+    depends_on:
+      signoz-telemetrykeeper-clickhousekeeper-0:
+        condition: service_healthy
+      signoz-telemetrystore-clickhouse-user-scripts:
+        condition: service_completed_successfully
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      CLICKHOUSE_CONFIG: /etc/clickhouse-server/config-0-0.yaml
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 40s
+      test:
+        - CMD
+        - wget
+        - --spider
+        - -q
+        - http://localhost:8123/ping
+      timeout: 10s
+    networks:
+      - signoz-network
+    restart: unless-stopped
+    volumes:
+      - signoz-telemetrystore-0-0-data:/var/lib/clickhouse
+      - signoz-telemetrystore-user-scripts:/var/lib/clickhouse/user_scripts:ro
+      - ./config/telemetrystore/clickhouse/config-0-0.yaml:/etc/clickhouse-server/config-0-0.yaml:ro,z
+      - ./config/telemetrystore/clickhouse/functions.yaml:/etc/clickhouse-server/functions.yaml:ro,z
+
+  # ---------------------------------------------------------------------------
+  # 一次性：准备 ClickHouse 的 histogramQuantile 可执行函数
+  # 离线包已内置 linux-amd64 / linux-arm64 二进制；缺失时才回退到 GitHub 下载
+  # ---------------------------------------------------------------------------
+  signoz-telemetrystore-clickhouse-user-scripts:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12.5}
+    container_name: signoz-telemetrystore-clickhouse-user-scripts
+    command:
+      - bash
+      - -c
+      - |-
+        set -e
+        node_arch=$$(uname -m | sed s/aarch64/arm64/ | sed s/x86_64/amd64/)
+        src="/assets/histogram-quantile/histogram-quantile-linux-$${node_arch}"
+        if [ -f "$${src}" ]; then
+          echo "使用离线二进制: $${src}"
+          cp "$${src}" /var/lib/clickhouse/user_scripts/histogramQuantile
+        else
+          echo "离线二进制缺失，尝试从 GitHub 下载（需要外网）"
+          cd /tmp
+          wget -O histogram-quantile.tar.gz "https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2Fv0.0.1/histogram-quantile_linux_$${node_arch}.tar.gz"
+          tar -xzf histogram-quantile.tar.gz
+          mv histogram-quantile /var/lib/clickhouse/user_scripts/histogramQuantile
+        fi
+        chmod +x /var/lib/clickhouse/user_scripts/histogramQuantile
+    networks:
+      - signoz-network
+    restart: on-failure
+    volumes:
+      - signoz-telemetrystore-user-scripts:/var/lib/clickhouse/user_scripts
+      - ./assets/histogram-quantile:/assets/histogram-quantile:ro,z
+
+  # ---------------------------------------------------------------------------
+  # 一次性：ClickHouse 建库建表与 schema 迁移
+  # ---------------------------------------------------------------------------
+  signoz-telemetrystore-migrator:
+    image: signoz/signoz-otel-collector:${COLLECTOR_VERSION:-v0.144.14}
+    container_name: signoz-telemetrystore-migrator
+    command:
+      - -c
+      - |
+        /signoz-otel-collector migrate ready &&
+        /signoz-otel-collector migrate bootstrap &&
+        /signoz-otel-collector migrate sync up &&
+        /signoz-otel-collector migrate async up
+    entrypoint:
+      - /bin/sh
+    environment:
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN: tcp://signoz-telemetrystore-clickhouse-0-0:9000
+      SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
+    depends_on:
+      signoz-telemetrystore-clickhouse-0-0:
+        condition: service_healthy
+    networks:
+      - signoz-network
+    restart: on-failure
+
+volumes:
+  signoz-metastore-postgres-0-data:
+    name: signoz-metastore-postgres-0-data
+  signoz-telemetrykeeper-0-data:
+    name: signoz-telemetrykeeper-0-data
+  signoz-telemetrystore-0-0-data:
+    name: signoz-telemetrystore-0-0-data
+  signoz-telemetrystore-user-scripts:
+    name: signoz-telemetrystore-user-scripts
