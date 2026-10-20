@@ -334,7 +334,7 @@ GitHub Actions：
 
 CNB（[cnb.cool](https://cnb.cool/jackch3n/signoz-docker)）的 `.cnb.yml` 与上述行为对齐：
 main / master push 发布 `latest`，`v*` tag 发布同名 Release，页面手动触发发布 `latest`，
-PR 只做轻量校验。CNB 流水线在同一条流水线里串行构建两个架构，最后统一上传附件。
+PR 只做轻量校验。CNB 流水线的 amd64 / arm64 分别在原生 runner 上并行构建，最后合并上传到同一个 Release。
 
 发版示例：
 
