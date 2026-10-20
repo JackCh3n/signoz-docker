@@ -1,30 +1,49 @@
 # =============================================================================
-# SigNoz 离线包 · CNB (cnb.cool) 云原生构建流水线
+# SigNoz 离线包 · CNB (cnb.cool) 云原生构建流水线（amd64 + arm64）
 #
 # 与 .github/workflows/release.yml 的行为对齐：
-#   - push main/master : 构建 amd64 + arm64 离线包，滚动发布 Release `latest`
+#   - push main/master : 构建双架构离线包，滚动发布 Release `latest`
 #   - push tag v*      : 构建后发布到同名 Release（固化）
 #   - web_trigger      : 页面手动触发，发布 `latest`
 #   - pull_request     : 只做脚本语法与离线资产轻量校验
 #
-# 构建要点
-#   1. 必须声明 `services: [docker]`，由 CNB 注入 dind 与 docker CLI，
-#      否则 bundle.sh 会在 `docker info` 处失败。
-#   2. 两个架构在同一个流水线里串行构建：bundle.sh 只做 docker pull/save，
-#      异架构镜像不需要 QEMU；构建完 amd64 后清理一次 dind 镜像，给 arm64 腾磁盘。
-#   3. 只创建一次 Release（git:release），再由 attachments 上传两个架构的
-#      离线包，避免两条并行流水线同时写同一个 Release 产生竞争。
+# 架构策略
+# --------
+#   两个架构分别在原生 runner 上构建：
+#     amd64 -> runner.tags: cnb:arch:amd64
+#     arm64 -> runner.tags: cnb:arch:arm64:v8
+#
+#   不要改回「一个 amd64 runner 串行构建两个架构」：CNB 的 dind 是单架构环境，
+#   跨架构 `docker pull --platform linux/arm64` 会失败（线上实测 build-arm64
+#   阶段直接报错，amd64 正常）。原生 runner 同时也避免了两套镜像叠加占磁盘。
+#
+# 发布策略
+# --------
+#   两条流水线各自把「本架构」产物上传到**同一个** Release。因此 ensure-release
+#   必须幂等且并发安全：已存在则更新标题/描述，创建冲突的 409/422 视为已存在。
+#   上传阶段只 glob 本流水线 workspace 下的 dist/*，两个架构互不覆盖。
 # =============================================================================
 
-# ── 发布环境（amd64 节点；arm64 镜像只拉取不运行，无需 ARM runner） ─────────
-.release-env: &release-env
+# ── 构建环境（按架构各一份；runner 只能写在流水线级别） ────────────────────
+# buildpack-deps:bookworm-curl 自带 bash/curl/tar/gzip/sha256sum，
+# ensure-release 阶段需要 curl 调 CNB Release API。
+.release-env-amd64: &release-env-amd64
   runner:
     tags: cnb:arch:amd64
     cpus: 8
   services:
     - docker
   docker:
-    image: debian:bookworm-slim
+    image: buildpack-deps:bookworm-curl
+
+.release-env-arm64: &release-env-arm64
+  runner:
+    tags: cnb:arch:arm64:v8
+    cpus: 8
+  services:
+    - docker
+  docker:
+    image: buildpack-deps:bookworm-curl
 
 # 只在影响离线包内容的文件变动时触发，避免 README 改动也跑一次 GB 级构建
 .if-modify: &if-modify
@@ -36,7 +55,7 @@
   - "assets/**"
   - ".cnb.yml"
 
-# ── 发布流水线（主线 / 版本 tag / 手动触发共用） ───────────────────────────
+# ── 公共阶段（两架构共用；差异只有 TARGET_ARCH 与流水线 runner） ───────────
 .stages: &stages
   # 判定本次是主线还是版本 tag（tag_push 时 CNB_BRANCH 为 tag 名）
   - name: resolve-scene
@@ -47,24 +66,29 @@
         v*)
           TAG="$REF"
           TITLE="SigNoz 离线部署包 ${TAG}"
+          MK="false"
           echo ">>> 场景: 版本发布（tag=${TAG}）"
           ;;
         *)
           TAG="latest"
           TITLE="SigNoz 离线部署包（latest）"
+          MK="true"
           echo ">>> 场景: 主线发布（ref=${REF}）"
           ;;
       esac
       echo "##[set-output TAG=${TAG}]"
       echo "##[set-output TITLE=${TITLE}]"
+      echo "##[set-output MK=${MK}]"
     exports:
       TAG: RELEASE_TAG
       TITLE: RELEASE_TITLE
+      MK: RELEASE_MAKE_LATEST
 
   # 失败前置拦截：脚本语法、必要文件、dind 可用性
   - name: validate
     script: |
       set -e
+      echo ">>> 目标架构: ${TARGET_ARCH}（runner: $(uname -m)）"
       bash -n bundle.sh install.sh
       for f in docker-compose.yaml install.sh .env.example README.md \
                config/ingester/ingester.yaml config/ingester/opamp.yaml \
@@ -78,17 +102,10 @@
       docker version --format 'Docker {{.Server.Version}}'
       echo ">>> 预检通过"
 
-  - name: build-amd64
+  - name: build
     script: |
       set -e
-      bash ./bundle.sh --arch amd64
-      # 清掉 amd64 镜像层，给 arm64 留出磁盘（dind 数据卷通常只有几十 GB）
-      docker image prune -af >/dev/null 2>&1 || true
-
-  - name: build-arm64
-    script: |
-      set -e
-      bash ./bundle.sh --arch arm64
+      bash ./bundle.sh --arch "${TARGET_ARCH}"
 
   - name: verify
     script: |
@@ -102,6 +119,7 @@
         [ "$size" -lt 2147483648 ] || { echo "超过 Release 2 GiB 单文件上限"; exit 1; }
       done
 
+  # 两条流水线写同一份说明（静态列出双架构），谁后写都不影响结果
   - name: gen-notes
     script: |
       set -e
@@ -126,13 +144,12 @@
         echo
         echo "### 产物"
         echo
-        echo "| 架构 | 文件 | 大小 |"
-        echo "|------|------|------|"
-        for f in dist/*.tar.gz; do
-          name="$(basename "$f")"
-          arch="$(printf '%s' "$name" | sed -nE 's/.*-(amd64|arm64)\.tar\.gz/\1/p')"
-          printf '| %s | %s | %s |\n' "${arch:-unknown}" "\`${name}\`" "$(du -h "$f" | cut -f1)"
-        done
+        echo "| 架构 | 文件 |"
+        echo "|------|------|"
+        echo "| amd64 | \`signoz-offline-${SIGNOZ_VERSION}-amd64.tar.gz\` |"
+        echo "| arm64 | \`signoz-offline-${SIGNOZ_VERSION}-arm64.tar.gz\` |"
+        echo
+        echo "两个压缩包旁均有同名 \`.sha256\` 校验文件。"
         echo
         echo "### 内网安装"
         echo
@@ -150,13 +167,63 @@
       } > RELEASE_NOTES.md
       cat RELEASE_NOTES.md
 
-  - name: create-release
-    type: git:release
-    options:
-      tag: $RELEASE_TAG
-      title: $RELEASE_TITLE
-      descriptionFromFile: RELEASE_NOTES.md
-      latest: true
+  # 幂等 + 并发安全地确保 Release 存在（两条架构流水线可能同时创建）
+  - name: ensure-release
+    script: |
+      set -e
+      TAG="${RELEASE_TAG:?缺少 RELEASE_TAG}"
+      NAME="${RELEASE_TITLE:-$TAG}"
+      MK="${RELEASE_MAKE_LATEST:-false}"
+      API="https://api.cnb.cool/${CNB_REPO_SLUG}/-/releases"
+      H_AUTH="Authorization: Bearer ${CNB_TOKEN}"
+      H_ACC="Accept: application/vnd.cnb.api+json"
+
+      rel_id() {
+        curl -s -m 30 -H "$H_AUTH" -H "$H_ACC" "${API}" \
+          | tr -d ' \t\n' \
+          | grep -oE "\"id\":\"[0-9]+\",\"tag_name\":\"$1\"" \
+          | head -n 1 | grep -oE '[0-9]+' || true
+      }
+
+      BODY=$(sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g' RELEASE_NOTES.md)
+
+      echo ">>> 确保 Release 存在: ${TAG}（make_latest=${MK}）"
+      OK="no"
+      for attempt in 1 2 3 4 5; do
+        ID="$(rel_id "$TAG")"
+        if [ -n "$ID" ]; then
+          echo ">>> 已存在（id=${ID}），更新标题与描述"
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -m 30 -X PATCH \
+            -H "$H_AUTH" -H "Content-Type: application/json" -H "$H_ACC" \
+            "${API}/${ID}" \
+            -d "{\"name\":\"${NAME}\",\"body\":\"${BODY}\",\"make_latest\":\"${MK}\"}") || HTTP="000"
+          echo ">>> PATCH 结果: HTTP ${HTTP}"
+          OK="yes"
+          break
+        fi
+
+        echo ">>> 不存在，创建（第 ${attempt} 次尝试）"
+        HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" -m 30 -X POST \
+          -H "$H_AUTH" -H "Content-Type: application/json" -H "$H_ACC" \
+          "${API}" \
+          -d "{\"tag_name\":\"${TAG}\",\"name\":\"${NAME}\",\"body\":\"${BODY}\",\"draft\":false,\"prerelease\":false,\"make_latest\":\"${MK}\",\"target_commitish\":\"${CNB_COMMIT:-main}\"}") || HTTP="000"
+        echo ">>> POST 结果: HTTP ${HTTP}"
+        case "$HTTP" in
+          200|201) OK="yes"; break ;;
+          409|422)
+            echo ">>> 另一条架构流水线抢先创建，视为已存在"
+            OK="yes"; break ;;
+        esac
+        head -c 300 /tmp/rel.json 2>/dev/null || true
+        echo
+        echo ">>> 第 ${attempt} 次失败，3s 后重试"
+        sleep 3
+      done
+      if [ "$OK" != "yes" ]; then
+        echo "!!! Release 创建失败（tag=${TAG}）"
+        exit 1
+      fi
+      echo ">>> Release ${TAG} 就绪"
 
   - name: upload-attachments
     image: cnbcool/attachments:latest
@@ -165,18 +232,34 @@
       attachments:
         - "./dist/*"
 
-# ── 主线：main / master push → 滚动发布 latest ─────────────────────────────
+# ── 主线：main / master push → 双架构并行发布 latest ─────────────────────
 main:
   push:
-    - name: release-mainline
-      <<: *release-env
+    - name: release-amd64
+      <<: *release-env-amd64
+      env:
+        TARGET_ARCH: amd64
+      ifModify: *if-modify
+      stages: *stages
+    - name: release-arm64
+      <<: *release-env-arm64
+      env:
+        TARGET_ARCH: arm64
       ifModify: *if-modify
       stages: *stages
 
 master:
   push:
-    - name: release-mainline
-      <<: *release-env
+    - name: release-amd64
+      <<: *release-env-amd64
+      env:
+        TARGET_ARCH: amd64
+      ifModify: *if-modify
+      stages: *stages
+    - name: release-arm64
+      <<: *release-env-arm64
+      env:
+        TARGET_ARCH: arm64
       ifModify: *if-modify
       stages: *stages
 
@@ -184,15 +267,29 @@ master:
 # 注意：不要改成兜底 `$`，否则 mainline 创建的 `latest` tag 会再次触发构建。
 "v*":
   tag_push:
-    - name: release-tag
-      <<: *release-env
+    - name: release-amd64
+      <<: *release-env-amd64
+      env:
+        TARGET_ARCH: amd64
+      stages: *stages
+    - name: release-arm64
+      <<: *release-env-arm64
+      env:
+        TARGET_ARCH: arm64
       stages: *stages
 
 # ── 手动触发与 PR 校验 ─────────────────────────────────────────────────────
 "**":
   web_trigger:
-    - name: release-manual
-      <<: *release-env
+    - name: release-amd64
+      <<: *release-env-amd64
+      env:
+        TARGET_ARCH: amd64
+      stages: *stages
+    - name: release-arm64
+      <<: *release-env-arm64
+      env:
+        TARGET_ARCH: arm64
       stages: *stages
 
   pull_request:
