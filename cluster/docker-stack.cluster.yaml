@@ -40,6 +40,9 @@ services:
   signoz-keeper-0:
     image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
     hostname: signoz-keeper-0
+    expose:
+      - "9181"
+      - "9234"
     entrypoint:
       - /usr/bin/clickhouse-keeper
       - --config-file=/etc/clickhouse-keeper/keeper.yaml
@@ -76,6 +79,9 @@ services:
   signoz-keeper-1:
     image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
     hostname: signoz-keeper-1
+    expose:
+      - "9181"
+      - "9234"
     entrypoint:
       - /usr/bin/clickhouse-keeper
       - --config-file=/etc/clickhouse-keeper/keeper.yaml
@@ -112,6 +118,9 @@ services:
   signoz-keeper-2:
     image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
     hostname: signoz-keeper-2
+    expose:
+      - "9181"
+      - "9234"
     entrypoint:
       - /usr/bin/clickhouse-keeper
       - --config-file=/etc/clickhouse-keeper/keeper.yaml
@@ -149,6 +158,10 @@ services:
   signoz-clickhouse-0:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12.5}
     hostname: signoz-clickhouse-0
+    expose:
+      - "9000"
+      - "8123"
+      - "9009"
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     volumes:
@@ -187,6 +200,10 @@ services:
   signoz-clickhouse-1:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12.5}
     hostname: signoz-clickhouse-1
+    expose:
+      - "9000"
+      - "8123"
+      - "9009"
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     volumes:
@@ -225,6 +242,9 @@ services:
   # ── ClickHouse 访问入口（HAProxy，2 副本） ───────────────────────────────
   signoz-clickhouse:
     image: haproxy:${HAPROXY_VERSION:-2.9-alpine}
+    expose:
+      - "9000"
+      - "8123"
     volumes:
       - ${CLUSTER_DIR:-/opt/signoz-cluster}/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     networks:
@@ -258,6 +278,8 @@ services:
   signoz-postgres:
     image: postgres:${POSTGRES_VERSION:-16}
     hostname: signoz-postgres
+    expose:
+      - "5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-signoz}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-signoz}
@@ -294,6 +316,9 @@ services:
   # ── SigNoz 后端 / 前端（双副本） ─────────────────────────────────────────
   signoz-signoz:
     image: signoz/signoz:${SIGNOZ_VERSION:-v0.146.0}
+    expose:
+      - "8085"
+      - "4320"
     environment:
       SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://${POSTGRES_USER:-signoz}:${POSTGRES_PASSWORD:-signoz}@signoz-postgres:5432/${POSTGRES_DB:-signoz}?sslmode=disable
       SIGNOZ_SQLSTORE_PROVIDER: postgres
@@ -332,6 +357,8 @@ services:
   # ── OTLP Collector（双副本） ─────────────────────────────────────────────
   signoz-ingester:
     image: signoz/signoz-otel-collector:${COLLECTOR_VERSION:-v0.144.14}
+    expose:
+      - "13133"
     entrypoint:
       - /bin/sh
     command:
