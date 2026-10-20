@@ -1,0 +1,57 @@
+<clickhouse>
+    <display_name>cluster</display_name>
+    <listen_host>0.0.0.0</listen_host>
+
+    <interserver_http_host>signoz-clickhouse-1</interserver_http_host>
+    <interserver_http_port>9009</interserver_http_port>
+
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+
+    <remote_servers>
+        <cluster>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>signoz-clickhouse-0</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>signoz-clickhouse-1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </cluster>
+    </remote_servers>
+
+    <zookeeper>
+        <node>
+            <host>signoz-keeper-0</host>
+            <port>9181</port>
+        </node>
+        <node>
+            <host>signoz-keeper-1</host>
+            <port>9181</port>
+        </node>
+        <node>
+            <host>signoz-keeper-2</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+
+    <macros>
+        <shard>01</shard>
+        <replica>02</replica>
+    </macros>
+
+    <user_defined_executable_functions_config>*functions.yaml</user_defined_executable_functions_config>
+    <user_scripts_path>/opt/signoz-cluster/bin/</user_scripts_path>
+
+    <max_server_memory_usage>3221225472</max_server_memory_usage>
+
+    <logger>
+        <level>information</level>
+        <console>1</console>
+    </logger>
+</clickhouse>

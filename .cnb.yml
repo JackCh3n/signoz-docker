@@ -301,6 +301,9 @@ master:
           script: |
             set -e
             bash -n bundle.sh install.sh
+            if [ -d cluster ]; then
+              bash -n cluster/bundle-cluster.sh cluster/install-cluster.sh
+            fi
             for f in docker-compose.yaml install.sh .env.example \
                      config/ingester/ingester.yaml config/ingester/opamp.yaml \
                      config/telemetrykeeper/clickhousekeeper/keeper-0.yaml \
@@ -311,3 +314,34 @@ master:
               [ -f "$f" ] || { echo "缺少必要文件: $f"; exit 1; }
             done
             echo ">>> 校验通过"
+
+# ── cluster 分支：只做静态校验，不发布离线包 ───────────────────────────────
+cluster:
+  push:
+    - name: validate-cluster
+      docker:
+        image: debian:bookworm-slim
+      ifModify:
+        - "cluster/**"
+        - ".cnb.yml"
+      stages:
+        - name: shell-and-files
+          script: |
+            set -e
+            bash -n cluster/bundle-cluster.sh cluster/install-cluster.sh
+            for f in cluster/docker-stack.cluster.yaml cluster/haproxy.cfg \
+                     cluster/install-cluster.sh cluster/bundle-cluster.sh \
+                     cluster/config/clickhouse/cluster-0.xml \
+                     cluster/config/clickhouse/cluster-1.xml \
+                     cluster/config/clickhouse/users.xml \
+                     cluster/config/clickhouse/functions.yaml \
+                     cluster/config/keeper/keeper-0.yaml \
+                     cluster/config/keeper/keeper-1.yaml \
+                     cluster/config/keeper/keeper-2.yaml \
+                     cluster/config/ingester/ingester.yaml; do
+              [ -f "$f" ] || { echo "缺少必要文件: $f"; exit 1; }
+            done
+            grep -q 'signoz-clickhouse-1' cluster/config/clickhouse/cluster-0.xml
+            grep -q 'signoz-keeper-2' cluster/config/keeper/keeper-0.yaml
+            grep -q 'signoz-clickhouse:9000' cluster/config/ingester/ingester.yaml
+            echo ">>> cluster 静态校验通过"

@@ -8,3 +8,6 @@ assets/otel-javaagent/
 # 若手动放置镜像包，避免误提交
 *.tar
 *.tar.gz
+
+# 集群模式本机参数（不提交）
+cluster/.env.cluster

@@ -19,12 +19,46 @@ jobs:
         run: |
           bash -n bundle.sh
           bash -n install.sh
+          if [ -d cluster ]; then
+            bash -n cluster/bundle-cluster.sh cluster/install-cluster.sh
+          fi
 
       - name: ShellCheck
-        run: shellcheck bundle.sh install.sh
+        run: |
+          shellcheck bundle.sh install.sh
+          if [ -d cluster ]; then
+            shellcheck cluster/bundle-cluster.sh cluster/install-cluster.sh
+          fi
 
       - name: Validate Compose file
         run: docker compose -f docker-compose.yaml config > /dev/null
+
+      - name: Validate cluster stack and configs
+        if: hashFiles('cluster/docker-stack.cluster.yaml') != ''
+        run: |
+          set -e
+          if docker stack config --help >/dev/null 2>&1; then
+            CLUSTER_DIR=/opt/signoz-cluster docker stack config -c cluster/docker-stack.cluster.yaml > /dev/null
+          else
+            echo "docker stack config 不可用，跳过 stack 解析"
+          fi
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          for p in [
+              "cluster/config/clickhouse/cluster-0.xml",
+              "cluster/config/clickhouse/cluster-1.xml",
+              "cluster/config/clickhouse/users.xml",
+          ]:
+              with open(p, encoding="utf-8") as f:
+                  data = f.read()
+              if "<!DOCTYPE" in data or "<!ENTITY" in data:
+                  raise SystemExit(f"DTD/entity not allowed: {p}")
+              ET.fromstring(data)
+          print("cluster XML OK")
+          PY
+          grep -q 'signoz-clickhouse-1' cluster/config/clickhouse/cluster-0.xml
+          grep -q 'signoz-keeper-2' cluster/config/keeper/keeper-0.yaml
+          grep -q 'signoz-clickhouse:9000' cluster/config/ingester/ingester.yaml
 
       - name: Verify offline assets
         run: |

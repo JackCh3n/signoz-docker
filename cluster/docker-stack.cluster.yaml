@@ -1,0 +1,413 @@
+# =============================================================================
+# SigNoz 集群 / 多节点模式（Docker Swarm）
+#
+# 拓扑（默认 3 节点）：
+#   node1: keeper-0 + clickhouse-0 + postgres
+#   node2: keeper-1 + clickhouse-1
+#   node3: keeper-2 + HAProxy + 应用副本
+#
+#   ClickHouse: 1 shard x 2 replicas（ReplicatedMergeTree）
+#   Keeper:     3 节点 Raft（容忍 1 节点故障）
+#   HAProxy:    ClickHouse 访问入口（9000/8123），屏蔽单节点故障
+#   SigNoz / Collector: 2 副本，Swarm routing mesh 负载均衡
+#   Postgres:   单实例（元数据存储，唯一 SPOF，文档中明确说明）
+#
+# 部署前必须：
+#   1. 每个节点都执行过 ./install-cluster.sh --prepare（加载镜像、准备 /opt/signoz-cluster）
+#   2. docker swarm init 完成，节点已加入
+#   3. 管理节点执行 ./install-cluster.sh --deploy --nodes n1,n2,n3 自动打 node label
+#
+# 不要用 docker compose up 启动本文件；它只用于 docker stack deploy。
+# =============================================================================
+version: "3.8"
+
+networks:
+  signoz-cluster:
+    driver: overlay
+    # 允许 install-cluster.sh 用 docker run --network 附加到该网络做巡检
+    attachable: true
+
+volumes:
+  keeper-0-data:
+  keeper-1-data:
+  keeper-2-data:
+  clickhouse-0-data:
+  clickhouse-1-data:
+  postgres-data:
+
+services:
+  # ── ClickHouse Keeper（3 节点 Raft） ─────────────────────────────────────
+  signoz-keeper-0:
+    image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
+    hostname: signoz-keeper-0
+    entrypoint:
+      - /usr/bin/clickhouse-keeper
+      - --config-file=/etc/clickhouse-keeper/keeper.yaml
+    volumes:
+      - keeper-0-data:/var/lib/clickhouse-keeper
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/keeper/keeper-0.yaml:/etc/clickhouse-keeper/keeper.yaml:ro
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "clickhouse-keeper-client", "-h", "localhost", "-p", "9181", "-q", "ls"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.signoz-node == 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  signoz-keeper-1:
+    image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
+    hostname: signoz-keeper-1
+    entrypoint:
+      - /usr/bin/clickhouse-keeper
+      - --config-file=/etc/clickhouse-keeper/keeper.yaml
+    volumes:
+      - keeper-1-data:/var/lib/clickhouse-keeper
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/keeper/keeper-1.yaml:/etc/clickhouse-keeper/keeper.yaml:ro
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "clickhouse-keeper-client", "-h", "localhost", "-p", "9181", "-q", "ls"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.signoz-node == 2
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  signoz-keeper-2:
+    image: clickhouse/clickhouse-keeper:${CLICKHOUSE_VERSION:-25.12.5}
+    hostname: signoz-keeper-2
+    entrypoint:
+      - /usr/bin/clickhouse-keeper
+      - --config-file=/etc/clickhouse-keeper/keeper.yaml
+    volumes:
+      - keeper-2-data:/var/lib/clickhouse-keeper
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/keeper/keeper-2.yaml:/etc/clickhouse-keeper/keeper.yaml:ro
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "clickhouse-keeper-client", "-h", "localhost", "-p", "9181", "-q", "ls"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.signoz-node == 3
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  # ── ClickHouse（1 shard x 2 replicas） ───────────────────────────────────
+  signoz-clickhouse-0:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12.5}
+    hostname: signoz-clickhouse-0
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - clickhouse-0-data:/var/lib/clickhouse
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/clickhouse/cluster-0.xml:/etc/clickhouse-server/config.d/zz-cluster.xml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/clickhouse/users.xml:/etc/clickhouse-server/users.d/zz-users.xml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/clickhouse/functions.yaml:/etc/clickhouse-server/functions.yaml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/bin:/opt/signoz-cluster/bin:ro
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 120s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.signoz-node == 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+
+  signoz-clickhouse-1:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12.5}
+    hostname: signoz-clickhouse-1
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - clickhouse-1-data:/var/lib/clickhouse
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/clickhouse/cluster-1.xml:/etc/clickhouse-server/config.d/zz-cluster.xml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/clickhouse/users.xml:/etc/clickhouse-server/users.d/zz-users.xml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/clickhouse/functions.yaml:/etc/clickhouse-server/functions.yaml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/bin:/opt/signoz-cluster/bin:ro
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 120s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.signoz-node == 2
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+
+  # ── ClickHouse 访问入口（HAProxy，2 副本） ───────────────────────────────
+  signoz-clickhouse:
+    image: haproxy:${HAPROXY_VERSION:-2.9-alpine}
+    volumes:
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 10s
+    deploy:
+      replicas: 2
+      placement:
+        preferences:
+          - spread: node.labels.signoz-node
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: start-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ── PostgreSQL（元数据存储，单实例） ─────────────────────────────────────
+  signoz-postgres:
+    image: postgres:${POSTGRES_VERSION:-16}
+    hostname: signoz-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-signoz}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-signoz}
+      POSTGRES_USER: ${POSTGRES_USER:-signoz}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.signoz-node == 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+
+  # ── SigNoz 后端 / 前端（双副本） ─────────────────────────────────────────
+  signoz-signoz:
+    image: signoz/signoz:${SIGNOZ_VERSION:-v0.146.0}
+    environment:
+      SIGNOZ_SQLSTORE_POSTGRES_DSN: postgres://${POSTGRES_USER:-signoz}:${POSTGRES_PASSWORD:-signoz}@signoz-postgres:5432/${POSTGRES_DB:-signoz}?sslmode=disable
+      SIGNOZ_SQLSTORE_PROVIDER: postgres
+      SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_CLUSTER: cluster
+      SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://signoz-clickhouse:9000
+      SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+    ports:
+      - "${SIGNOZ_HTTP_PORT:-8080}:8080"
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 2
+      placement:
+        preferences:
+          - spread: node.labels.signoz-node
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: start-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+
+  # ── OTLP Collector（双副本） ─────────────────────────────────────────────
+  signoz-ingester:
+    image: signoz/signoz-otel-collector:${COLLECTOR_VERSION:-v0.144.14}
+    entrypoint:
+      - /bin/sh
+    command:
+      - -c
+      - |
+        /signoz-otel-collector migrate sync check &&
+        /signoz-otel-collector --config=/etc/otel-collector-config.yaml --manager-config=/etc/opamp-config.yaml --copy-path=/var/tmp/collector-config.yaml
+    environment:
+      LOW_CARDINAL_EXCEPTION_GROUPING: "false"
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_CLUSTER: cluster
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN: tcp://signoz-clickhouse:9000
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION: "true"
+      SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
+    volumes:
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/ingester/ingester.yaml:/etc/otel-collector-config.yaml:ro
+      - ${CLUSTER_DIR:-/opt/signoz-cluster}/config/ingester/opamp.yaml:/etc/opamp-config.yaml:ro
+    ports:
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    networks:
+      - signoz-cluster
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:13133 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 30s
+    deploy:
+      replicas: 2
+      placement:
+        preferences:
+          - spread: node.labels.signoz-node
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: start-first
+        delay: 10s
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+
+  # ── 一次性 schema 迁移（install-cluster.sh 会 force 重跑并等待完成） ──────
+  signoz-migrator:
+    image: signoz/signoz-otel-collector:${COLLECTOR_VERSION:-v0.144.14}
+    entrypoint:
+      - /bin/sh
+    command:
+      - -c
+      - |
+        until /signoz-otel-collector migrate ready; do
+          echo "waiting for clickhouse cluster..."
+          sleep 5
+        done
+        /signoz-otel-collector migrate bootstrap &&
+        /signoz-otel-collector migrate sync up &&
+        /signoz-otel-collector migrate async up
+    environment:
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_CLUSTER: cluster
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_DSN: tcp://signoz-clickhouse:9000
+      SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION: "true"
+      SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
+    networks:
+      - signoz-cluster
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: none
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G

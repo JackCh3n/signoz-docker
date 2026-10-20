@@ -4,6 +4,8 @@
 
 在联网机器上把镜像与配置打成一个离线包，传入内网后执行一条命令即可导入镜像并启动，全程不需要访问 Docker Hub 或 GitHub。
 
+> **`cluster` 分支新增多节点集群模式**：Docker Swarm + ClickHouse 1 shard × 2 replicas + 3 节点 Keeper + 双副本 SigNoz/Collector。单机模式保持不变，集群部署见 [cluster/README.md](cluster/README.md)。
+
 - 清单来源：SigNoz 官方 [Foundry](https://github.com/SigNoz/foundry) v0.3.0 生成的 Docker Compose，版本已固定
 - 适用场景：单机自建可观测平台，监控 Java / Spring Boot 等应用（Traces、Metrics、Logs）
 - 默认组件：SigNoz、OpenTelemetry Collector（SigNoz 发行版）、ClickHouse、ClickHouse Keeper、PostgreSQL
@@ -56,6 +58,12 @@ signoz-docker/
 ├── .github/workflows/ci.yml             # push / PR 轻量校验（不拉镜像）
 ├── .github/workflows/release.yml        # main / tag 构建双架构离线包并发布 Release
 ├── .cnb.yml                             # CNB 构建与发布流水线（与 GitHub 对齐）
+├── cluster/                             # 集群 / 多节点模式（Docker Swarm，cluster 分支）
+│   ├── README.md                        # 拓扑、部署、运维、限制
+│   ├── docker-stack.cluster.yaml        # Swarm stack
+│   ├── install-cluster.sh               # prepare / deploy / check / down
+│   ├── bundle-cluster.sh                # 集群离线包制作
+│   └── config/                          # ClickHouse / Keeper / Collector 集群配置
 └── dist/                                # 打包产物（不入库）
 ```
 
@@ -338,3 +346,35 @@ git push origin v0.146.0
 发布附件命名固定为 `signoz-offline-<SigNoz版本>-<架构>.tar.gz` 与对应 `.sha256`，
 下载后先 `sha256sum -c` 校验，再按第 4.2 节安装。CI 构建使用与本地 `bundle.sh`
 相同的脚本，因此产物内容一致。
+
+`cluster` 分支的 `ci.yml` 还会校验集群脚本语法与 `docker-stack.cluster.yaml`，
+但 GitHub/CNB 的 Release 流水线仍只发布单机离线包；集群包用
+`cluster/bundle-cluster.sh` 单独制作。
+
+## 11. 集群 / 多节点模式（cluster 分支）
+
+单机模式适合小规模内网；需要 ClickHouse 高可用或多节点时，使用本分支的
+Docker Swarm 方案：
+
+- ClickHouse：1 shard × 2 replicas（`ReplicatedMergeTree`）；
+- Keeper：3 节点 Raft，容忍 1 节点故障；
+- HAProxy：ClickHouse 双副本入口，自动摘除故障节点；
+- SigNoz / Collector：各 2 副本，Swarm routing mesh 负载均衡；
+- PostgreSQL：单实例（元数据唯一单点，文档中明确标注）。
+
+3 节点最低要求，每节点建议 8 核 / 16 GB / 200 GB SSD，所有节点同架构并启用 NTP。
+
+```bash
+# 联网机制作集群离线包
+bash cluster/bundle-cluster.sh --arch amd64
+
+# 每个节点解压到 /opt/signoz-cluster 后执行
+sudo bash ./install-cluster.sh --prepare
+
+# manager 初始化 Swarm 后部署
+sudo bash ./install-cluster.sh --deploy --nodes node1,node2,node3
+bash ./install-cluster.sh --check
+```
+
+完整拓扑、Swarm 初始化、节点标签、扩缩容、备份、升级顺序和故障演练见
+[cluster/README.md](cluster/README.md)。
