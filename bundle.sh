@@ -152,7 +152,16 @@ fi
 c_step "拉取镜像（目标平台 ${IMAGE_AGENT}）"
 for img in "${IMAGES[@]}"; do
   c_info "docker pull ${img}"
-  docker pull --platform "$IMAGE_AGENT" "$img"
+  _pulled="no"
+  for attempt in 1 2 3; do
+    if docker pull --platform "$IMAGE_AGENT" "$img"; then
+      _pulled="yes"
+      break
+    fi
+    c_warn "拉取失败（第 ${attempt}/3 次），10 秒后重试: ${img}"
+    sleep 10
+  done
+  [ "$_pulled" = "yes" ] || die "镜像拉取连续失败: ${img}（检查网络或 Docker Hub 限流）"
 done
 
 for img in "${IMAGES[@]}"; do

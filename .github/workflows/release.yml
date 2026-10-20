@@ -136,18 +136,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: 清理 runner 预装工具链
-        run: |
-          set -e
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          sudo docker image prune -af || true
-          df -h /
-
       - name: 预检
         run: |
           set -euo pipefail
+          df -h /
           bash -n bundle.sh install.sh
           test -x "assets/histogram-quantile/histogram-quantile-linux-${{ matrix.arch }}"
           docker version --format 'Docker {{.Server.Version}}'
